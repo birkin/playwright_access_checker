@@ -43,6 +43,7 @@ class Handler(BaseHTTPRequestHandler):
         Called by: BaseHTTPRequestHandler
         """
         site = self.server
+        assert isinstance(site, LocalSite)
         path = urlsplit(self.path).path
         site.hits.append({'path': self.path, 'started': time.monotonic(), 'referer': self.headers.get('Referer')})
         mode = site.mode
@@ -97,6 +98,11 @@ class Handler(BaseHTTPRequestHandler):
                 status, headers = 302, {'Location': self.path + '?view=full'}
             if mode == 'denial_page':
                 body = '<h1>Access denied</h1><div id="cf-error-details">Denied</div>'
+            if mode == 'no_content':
+                body = '<h1>Loading item</h1>'
+            if mode == 'hidden_title':
+                body = body.replace(f'<h1>Item {number}</h1>', f'<h1 hidden>Item {number}</h1>')
+            body += '<div id="feedbackModal" hidden><h1 class="modal-title">Feedback</h1></div>'
         elif path == '/challenge' or (path == '/scroll-data' and mode == 'scroll_challenge'):
             status, headers, body = 403, {'cf-mitigated': 'challenge', 'cf-ray': 'local-test-ray'}, 'Challenge'
         elif path.startswith('/thumb/'):

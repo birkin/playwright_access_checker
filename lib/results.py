@@ -178,6 +178,12 @@ def write_summary(directory: Path, data: dict, events: list[dict]) -> None:
         'verification_required',
     }:
         outcome += ' Inconclusive; this does not establish a browsing-rate threshold.'
+    missing_evidence = [event for event in events if event['kind'] == 'request_evidence_missing']
+    if missing_evidence:
+        outcome += (
+            f' Item-document response evidence is missing for {len(missing_evidence)} item(s);'
+            ' request counts are lower bounds and cannot establish a browsing-rate threshold.'
+        )
     if any(event['kind'] == 'collection_open' for event in events) and not any(
         event['kind'] == 'visit_ready' and event['visit_id'] == 'collection-1' for event in events
     ):
@@ -207,7 +213,9 @@ def write_summary(directory: Path, data: dict, events: list[dict]) -> None:
         f'- Settings took effect: {cell(settings["cf_settings_since"])}.',
         f'- Connection: {cell(settings["network_label"])}; public IP: {cell(settings["public_ip"])}. {cell(settings["ip_notes"])}',
         f'- Included BDR hosts: {cell(settings["bdr_hosts"])}.',
+        f'- Item-tab opening method: {cell(data.get("browser", {}).get("tab_opening_method"))}.',
         f'- Stopped during {cell(stop.get("stage"))}, tab {cell(stop.get("tab_id"))}, request {cell(stop.get("request_id"))}.',
+        f'- Affected item attempt: {cell(stop.get("attempt_id"))}.',
         f'- Evidence: HTTP {cell(stop.get("status"))}; source: {cell(stop.get("source"))}; Ray ID: {cell(stop.get("headers", {}).get("cf-ray"))}.',
         f'- Affected URL: {cell(stop.get("url"))}. Error: {cell(stop.get("error", stop.get("failure")))}.',
         f'- Selected links: {len(data["selected"])}; item attempts: {totals.get("item_attempts", 0)}; ready: {totals.get("item_successes", 0)}; completed views: {totals.get("completed_views", 0)}.',

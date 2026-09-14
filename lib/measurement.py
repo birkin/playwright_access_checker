@@ -6,10 +6,16 @@ import random
 import re
 from collections import Counter
 from itertools import pairwise
+from typing import TypedDict
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 WINDOWS = (30, 60, 120, 300)
 PUBLIC_QUERY_KEYS = {'page', 'per_page', 'sort', 'view', 'embed', 'selected_facets'}
+
+
+class SelectedItem(TypedDict):
+    position: int
+    url: str
 
 
 def safe_url(url: str) -> str:
@@ -50,13 +56,15 @@ def safe_error(error: Exception) -> str:
     return result
 
 
-def select_items(urls: list[str], start: int, limit: int) -> list[dict[str, object]]:
+def select_items(urls: list[str], start: int, limit: int) -> list[SelectedItem]:
     """
     Selects every other distinct item while preserving displayed order.
     Called by: browser_flow.gather_items()
     """
     unique = list(dict.fromkeys(urls))
-    selected = [{'position': index + 1, 'url': unique[index]} for index in range(start - 1, len(unique), 2)][:limit]
+    selected: list[SelectedItem] = [
+        SelectedItem(position=index + 1, url=unique[index]) for index in range(start - 1, len(unique), 2)
+    ][:limit]
     return selected
 
 

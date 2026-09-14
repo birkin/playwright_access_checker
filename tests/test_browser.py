@@ -7,10 +7,31 @@ import tempfile
 import unittest
 from unittest.mock import PropertyMock, patch
 
-from lib.browser_flow import run_trial
+from playwright.sync_api import Request, Response, sync_playwright
+
+from lib.browser_flow import click_link, run_trial
 from lib.config import Settings
-from lib.results import rebuild_report
+from lib.observation import Observer
+from lib.results import Recorder, rebuild_report
 from tests.local_site import LocalSite
+
+
+class MissingItemDocuments(Observer):
+    def on_request(self, request: Request) -> None:
+        """
+        Omits item-document notifications to exercise independent tab matching.
+        Called by: Playwright request notification
+        """
+        if not (request.resource_type == 'document' and '/studio/item/' in request.url):
+            super().on_request(request)
+
+    def on_response(self, response: Response) -> None:
+        """
+        Omits the corresponding response without inventing a successful request.
+        Called by: Playwright response notification
+        """
+        if not (response.request.resource_type == 'document' and '/studio/item/' in response.url):
+            super().on_response(response)
 
 
 class TestBrowser(unittest.TestCase):
@@ -36,10 +57,11 @@ class TestBrowser(unittest.TestCase):
         """
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self.site.mode = 'normal'
         self.site.hits = []
         self.site.collection_visits = 0
 
-    def run_case(self, workflow: str = 'tabs', mode: str = 'normal', **changes: object) -> tuple:
+    def run_case(self, workflow: str = 'tabs', mode: str = 'normal', headless: bool = True, **changes: object) -> tuple:
         """
         Checks a complete local trial with shortened deterministic timing.
         """
@@ -65,15 +87,16 @@ class TestBrowser(unittest.TestCase):
         values.update(changes)
         url = self.site.origin + '/studio/collections/bdr:nz9qn2kb/?page=1&per_page=50'
         with patch.object(Settings, 'collection_url', new_callable=PropertyMock, return_value=url):
-            recorder = run_trial(Settings(**values), headless=True)
+            recorder = run_trial(Settings(**values), headless=headless)
         data = json.loads((recorder.directory / 'run.json').read_text())
         return recorder, data
 
-    def test_tabs_overlap_and_first_requests(self) -> None:
+    def check_tabs_overlap_and_first_requests(self, headless: bool) -> None:
         """
         Checks later tabs open during a slow first load, first requests, referrers, and review order.
+        Called by: test_tabs_overlap_and_first_requests(), test_visible_tabs_overlap_and_first_requests()
         """
-        recorder, data = self.run_case(mode='slow')
+        recorder, data = self.run_case(mode='slow', headless=headless)
         self.assertEqual(data['stop_reason'], 'workflow_complete', data.get('stop'))
         opens = [event for event in recorder.events if event['kind'] == 'item_open']
         ready = [event for event in recorder.events if event['kind'] == 'item_ready']
@@ -91,11 +114,136 @@ class TestBrowser(unittest.TestCase):
         self.assertEqual(documents[0]['elapsed'], 0)
         self.assertTrue(all(event['tab_id'] for event in documents))
         self.assertTrue(all('/studio/collections/' in event['referer'] for event in documents[1:]))
+        self.assertCountEqual(
+            [event['url'] for event in documents],
+            [self.site.origin + hit['path'] for hit in self.site.hits if hit['path'].startswith('/studio/')],
+        )
+        self.assertTrue(all(event['focused'] for event in recorder.events if event['kind'] == 'overview_focus'))
+        self.assertFalse(any(event['kind'] == 'request_evidence_missing' for event in recorder.events))
         self.assertTrue(all('page=2' not in hit['path'] for hit in self.site.hits))
         self.assertEqual(
             len({event['request_id'] for event in recorder.events if event['kind'] == 'request'}),
             data['analysis']['totals']['all_bdr_requests'],
         )
+
+    def test_tabs_overlap_and_first_requests(self) -> None:
+        """
+        Checks overlapping loads and complete item-request recording in a hidden browser.
+        """
+        self.check_tabs_overlap_and_first_requests(headless=True)
+
+    def test_visible_tabs_overlap_and_first_requests(self) -> None:
+        """
+        Checks overlapping loads and complete item-request recording in a visible browser.
+        """
+        self.check_tabs_overlap_and_first_requests(headless=False)
+
+    def test_visible_tabs_scroll_in_order(self) -> None:
+        """
+        Checks a visible browser switches to and scrolls every selected item in order.
+        """
+        recorder, data = self.run_case(mode='long', headless=False, max_items=2, view_seconds=1.2)
+        self.assertEqual(data['stop_reason'], 'workflow_complete', data.get('stop'))
+        switches = [event for event in recorder.events if event['kind'] == 'tab_switch']
+        self.assertEqual([event['attempt_id'] for event in switches], ['item-1', 'item-2'])
+        scrolls = [event for event in recorder.events if event['kind'] == 'scroll' and event['purpose'] == 'item_viewing']
+        self.assertEqual([event['tab_id'] for event in scrolls], [event['tab_id'] for event in switches])
+        self.assertTrue(all(event['after']['y'] > event['before']['y'] for event in scrolls))
+        self.assertEqual(data['analysis']['totals']['completed_views'], 2)
+        observed = [
+            event for event in recorder.events if event['kind'] == 'page_observed' and '/studio/item/' in event['url']
+        ]
+        self.assertTrue(any(event['heading_count'] == 2 for event in observed))
+
+    def test_new_tab_click_restores_thumbnail_target(self) -> None:
+        """
+        Checks actual thumbnail clicks preserve their URLs and restore absent or existing targets.
+        """
+        settings = Settings(
+            output_dir=self.temp.name, bdr_hosts='127.0.0.1', collection_id='bdr:nz9qn2kb', workflow='tabs', max_items=2
+        )
+        recorder = Recorder(settings)
+        self.addCleanup(recorder.stream.close)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = browser.new_context()
+                observer = Observer(context, settings, recorder)
+                page = context.new_page()
+                page.goto(self.site.origin + '/studio/collections/bdr:nz9qn2kb/?page=1&per_page=50')
+                link = page.locator('.item-thumbnail a').first
+                original_href = link.get_attribute('href')
+                assert original_href is not None
+                for original_target in (None, '_self'):
+                    with self.subTest(original_target=original_target):
+                        if original_target is not None:
+                            link.evaluate('(element, target) => element.setAttribute("target", target)', original_target)
+                        with context.expect_page(timeout=3000) as opened:
+                            click_link(observer, link, new_tab=True)
+                        self.assertEqual(opened.value.url, self.site.origin + original_href)
+                        self.assertEqual(link.get_attribute('target'), original_target)
+                        self.assertEqual(link.get_attribute('href'), original_href)
+            finally:
+                browser.close()
+
+    def test_missing_requests_allow_viewing_with_explicit_evidence_limit(self) -> None:
+        """
+        Checks ready tabs can be viewed beyond the opening deadline when their request events are missing.
+        """
+        with patch('lib.browser_flow.Observer', MissingItemDocuments):
+            recorder, data = self.run_case(max_items=2, view_seconds=1.0, navigation_timeout_seconds=0.8)
+        self.assertEqual(data['stop_reason'], 'workflow_complete', data.get('stop'))
+        self.assertEqual(data['analysis']['totals']['completed_views'], 2)
+        bindings = [event for event in recorder.events if event['kind'] == 'attempt_tab']
+        self.assertEqual([event['source'] for event in bindings], ['page_url', 'page_url'])
+        self.assertEqual(sum(event['kind'] == 'request_evidence_missing' for event in recorder.events), 2)
+        self.assertFalse(any(event['kind'] == 'request' and '/studio/item/' in event['url'] for event in recorder.events))
+        report = (recorder.directory / 'summary.md').read_text()
+        self.assertIn('request counts are lower bounds', report)
+        rebuilt = rebuild_report(recorder.directory)
+        self.assertEqual(rebuilt['analysis'], data['analysis'])
+        self.assertIn('request counts are lower bounds', (recorder.directory / 'summary.md').read_text())
+
+    def test_unmatched_tab_timeout_identifies_item(self) -> None:
+        """
+        Checks a click that opens no tab reports the item and the tab-assignment wait.
+        """
+        with patch('lib.browser_flow.click_link'):
+            recorder, data = self.run_case(max_items=1, navigation_timeout_seconds=0.3)
+        self.assertEqual(data['stop_reason'], 'page_opening_timeout')
+        self.assertEqual(data['stop']['stage'], 'wait_for_item_tab')
+        self.assertEqual(data['stop']['attempt_id'], 'item-1')
+        self.assertFalse(data['stop']['page_assigned'])
+        self.assertEqual(data['stop']['url'], self.site.origin + '/studio/item/bdr:1/')
+        self.assertIn('No tab was matched', (recorder.directory / 'summary.md').read_text())
+
+    def test_open_tab_without_content_reports_content_timeout(self) -> None:
+        """
+        Checks a loaded document without item content reports its known tab and URL.
+        """
+        _, data = self.run_case(mode='no_content', headless=False, max_items=1, navigation_timeout_seconds=0.5)
+        self.assertEqual(data['stop_reason'], 'content_timeout', data.get('stop'))
+        self.assertEqual(data['stop']['tab_id'], 'tab-2')
+        self.assertEqual(data['stop']['url'], self.site.origin + '/studio/item/bdr:1/')
+
+    def test_hidden_item_title_does_not_count_as_ready(self) -> None:
+        """
+        Checks main content and a hidden item title do not satisfy readiness.
+        """
+        _, data = self.run_case(mode='hidden_title', max_items=1, navigation_timeout_seconds=0.5)
+        self.assertEqual(data['stop_reason'], 'content_timeout', data.get('stop'))
+        self.assertEqual(data['analysis']['totals']['item_successes'], 0)
+
+    def test_visible_item_response_timeout_records_request(self) -> None:
+        """
+        Checks a genuinely delayed visible-tab response times out with its recorded request and URL.
+        """
+        recorder, data = self.run_case(mode='timeout', headless=False, max_items=1, navigation_timeout_seconds=0.5)
+        self.assertEqual(data['stop_reason'], 'page_opening_timeout', data.get('stop'))
+        self.assertEqual(data['stop']['url'], self.site.origin + '/studio/item/bdr:1/')
+        self.assertIsNotNone(data['stop']['request_id'])
+        self.assertFalse(data['stop']['document_received'])
+        self.assertFalse(any(event['kind'] == 'view_start' for event in recorder.events))
 
     def test_return_preserves_order_and_one_tab(self) -> None:
         """
@@ -233,8 +381,17 @@ class TestBrowser(unittest.TestCase):
         """
         Checks redirects add requests while retaining one item attempt.
         """
-        recorder, data = self.run_case(mode='redirect', max_items=1)
-        self.assertEqual(data['stop_reason'], 'workflow_complete', data.get('stop'))
-        self.assertEqual(data['analysis']['totals']['item_attempts'], 1)
-        self.assertEqual(data['analysis']['totals']['page_requests'], 3)
-        self.assertTrue(any(event['kind'] == 'request' and event['redirected_from'] for event in recorder.events))
+        for headless in (True, False):
+            with self.subTest(headless=headless):
+                recorder, data = self.run_case(mode='redirect', max_items=1, headless=headless)
+                self.assertEqual(data['stop_reason'], 'workflow_complete', data.get('stop'))
+                self.assertEqual(data['analysis']['totals']['item_attempts'], 1)
+                self.assertEqual(data['analysis']['totals']['page_requests'], 3)
+                self.assertTrue(any(event['kind'] == 'request' and event['redirected_from'] for event in recorder.events))
+                documents = [
+                    event for event in recorder.events if event['kind'] == 'request' and event['resource_type'] == 'document'
+                ]
+                self.assertCountEqual(
+                    [event['url'] for event in documents],
+                    [self.site.origin + hit['path'] for hit in self.site.hits if hit['path'].startswith('/studio/')],
+                )

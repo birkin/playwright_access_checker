@@ -7,10 +7,10 @@ import re
 import time
 from urllib.parse import parse_qsl, urlsplit
 
-from playwright.sync_api import Error, Locator, Page, sync_playwright
+from playwright.sync_api import Error, Locator, Page, ProxySettings, sync_playwright
 
 from lib.config import Settings
-from lib.measurement import planned_times, safe_error, safe_url, select_items
+from lib.measurement import SelectedItem, planned_times, safe_error, safe_url, select_items
 from lib.observation import Attempt, Observer, TrialStopped, content_ready
 from lib.results import Recorder, timestamp
 
@@ -44,7 +44,14 @@ def wait_ready(observer: Observer, page: Page, role: str, visit_id: str) -> None
     while not content_ready(page, role):
         observer.poll()
         if time.monotonic() >= deadline:
-            observer.recorder.stop('content_timeout', tab_id=observer.pages[page], role=role, visit_id=visit_id)
+            observer.recorder.stop(
+                'content_timeout',
+                tab_id=observer.pages[page],
+                role=role,
+                visit_id=visit_id,
+                url=safe_url(page.url),
+                error='The tab opened, but expected page content did not become ready.',
+            )
             observer.guard()
         page.wait_for_timeout(50)
     observer.poll()
@@ -154,7 +161,7 @@ def thumbnail_urls(page: Page) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-def gather_items(observer: Observer, page: Page) -> list[dict]:
+def gather_items(observer: Observer, page: Page) -> list[SelectedItem]:
     """
     Gathers page-one thumbnails within shared time and scroll limits.
     Called by: run_workflow()
@@ -228,11 +235,27 @@ def find_link(observer: Observer, page: Page, locator: Locator, purpose: str) ->
 
 def click_link(observer: Observer, link: Locator, new_tab: bool = False) -> None:
     """
-    Clicks the site's link without waiting for a popup response or replacing its URL.
+    Clicks the actual link, temporarily targeting a new tab when requested.
     Called by: run_workflow(), return_to_collection(), restore_listing()
     """
     observer.guard()
-    link.click(button='middle' if new_tab else 'left', no_wait_after=True, timeout=observer.timeout_ms())
+    if new_tab:
+        ## A target=_blank click records initial requests that visible Chromium misses on middle-click.
+        original_target = link.get_attribute('target')
+        link.evaluate('(element) => element.setAttribute("target", "_blank")')
+        try:
+            observer.guard()
+            link.click(no_wait_after=True, timeout=observer.timeout_ms())
+        finally:
+            link.evaluate(
+                """(element, original) => {
+                if (original === null) element.removeAttribute('target');
+                else element.setAttribute('target', original);
+            }""",
+                original_target,
+            )
+    else:
+        link.click(no_wait_after=True, timeout=observer.timeout_ms())
     observer.guard()
 
 
@@ -242,6 +265,7 @@ def view_item(observer: Observer, attempt: Attempt, duration: float) -> None:
     Called by: run_workflow()
     """
     recorder = observer.recorder
+    recorder.stage, recorder.action_id = 'wait_for_item_tab', attempt.attempt_id
     while attempt.page is None:
         observer.poll()
         next(iter(observer.pages)).wait_for_timeout(50)
@@ -356,6 +380,7 @@ def return_to_collection(observer: Observer, attempt: Attempt) -> None:
     Called by: run_workflow()
     """
     page, recorder = attempt.page, observer.recorder
+    assert page is not None, 'Returning to the collection requires an opened item tab.'
     visit_id = 'return-' + attempt.attempt_id
     recorder.stage, recorder.action_id = 'return_to_collection', visit_id
     link = page.get_by_role('link', name=re.compile(r'^\s*Back to Results\s*$')).first
@@ -457,7 +482,7 @@ def run_trial(settings: Settings, headless: bool = False) -> Recorder:
     try:
         with sync_playwright() as playwright:
             try:
-                proxy = None
+                proxy: ProxySettings | None = None
                 if settings.proxy_server:
                     proxy = {'server': settings.proxy_server}
                     if settings.proxy_username:
@@ -473,7 +498,7 @@ def run_trial(settings: Settings, headless: bool = False) -> Recorder:
                     'locale': 'en-US',
                     'timezone': 'America/New_York',
                     'new_session': True,
-                    'tab_opening_method': 'middle mouse click on actual thumbnail',
+                    'tab_opening_method': 'left click on actual thumbnail with temporary target=_blank; original target restored',
                     'supporting_requests': 'enabled',
                     'cache': 'normal browser behavior',
                     'extra_headers': {},
